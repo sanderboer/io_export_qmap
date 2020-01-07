@@ -40,7 +40,8 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
     filter_glob: StringProperty(default="*.map", options={'HIDDEN'})
 
     option_sel: BoolProperty(name="Selection only", default=True)
-    option_tm: BoolProperty(name="Apply transform", default=True)
+    #option_tm: BoolProperty(name="Apply transform", default=True)
+    option_triangulate: BoolProperty(name="Triangulate faces", default=True)
     option_geo: EnumProperty(name="Geo", default='Faces',
         items=( ('Brushes', "Brushes", "Export each object as a convex brush"),
                 ('Faces', "Faces", "Export each face as a pyramid brush") ) )
@@ -48,6 +49,8 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
         description="Snap to grid (0 for off-grid)", min=0.0, max=256.0)
     option_depth: FloatProperty(name="Depth", default=8.0,
         description="Pyramid poke offset", min=0.0, max=256.0)
+    option_scale: FloatProperty(name="Scale", default=32.0,
+        description="Scale to Quake units", min=0.01, max=4096.0)
     option_format: EnumProperty(name="Format", default='Valve',
         items=( ('Quake', "Standard", "Axis-aligned texture projection"),
                 ('Valve', "Valve220", "Face-bound texture projection") ) )
@@ -64,6 +67,27 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
         else:
             return vector
 
+    def mesh_to_brush(self,mesh, obj):
+        geo = []
+        fw = geo.append
+  
+        for face in mesh.faces[:]:
+            fw('{\n')
+            for vert in reversed(face.verts[0:3]):
+                fw(f'( {self.printvec(vert.co)} ) ')
+                fw(self.texdata(face, mesh, obj))
+                pyr = bmesh.ops.poke(mesh, faces=[face],
+                                     offset=-self.option_depth)
+                apex = pyr['verts'][0].co
+                pyr['verts'][0].co = self.gridsnap(apex)
+                for pyrface in pyr['faces']:
+                    for vert in pyrface.verts[0:3]: # backfacing
+                        fw(f'( {self.printvec(vert.co)} ) ')
+                    pyrface.material_index = len(mobj.data.materials) - 1
+                    fw(self.texdata(pyrface, mesh, obj))
+                fw('}\n')
+        return fw
+                
     def printvec (self, vector):
         return ' '.join([f'{co:.5g}' for co in vector])
 
@@ -255,61 +279,85 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
         fw('{\n"classname" "worldspawn"\n')
         if self.option_format == 'Valve':
             fw('"mapversion" "220"\n')
-        bm = bmesh.new()
+            fw('}\n')
+            
+            # bm = bmesh.new()
 
         if self.option_geo == 'Faces' and objects != []:
-            orig_sel = context.selected_objects
-            orig_act = context.active_object
-            if orig_act is not None:
-                orig_mode = orig_act.mode
-                bpy.ops.object.mode_set(mode='OBJECT')
-            bpy.ops.object.select_all(action='DESELECT')
+            depsgraph = context.evaluated_depsgraph_get() 
             for obj in objects:
-                obj.select_set(True)
-            context.view_layer.objects.active = objects[0]
-            bpy.ops.object.duplicate()
-            bpy.ops.object.join()
-            mobj = context.active_object
-            mobj.data.materials.append(None) # empty slot for new faces
-            bm.from_mesh(mobj.data)
+                ob = obj.evaluated_get(depsgraph)
+                fw("{\n")
+                fw('"classname" "func_group"\n')
+                fw('"_phong" "1"\n')
+                fw('"_tb_type" "_tb_group"\n')
+                fw('"_tb_name" "' + ob.name + '"\n')
+                fw('"_tb_id" "' + ob.name + '"\n')
 
-            if self.option_tm:
-                bmesh.ops.transform(bm, matrix=obj.matrix_world,
-                                                verts=bm.verts)
-            for vert in bm.verts:
-                vert.co = self.gridsnap(vert.co)
-            bmesh.ops.connect_verts_concave(bm, faces=bm.faces)
-            bmesh.ops.connect_verts_nonplanar(bm, faces=bm.faces,
-                                                angle_limit=0.0)
-            for face in bm.faces[:]:
-                fw('{\n')
-                for vert in reversed(face.verts[0:3]):
-                    fw(f'( {self.printvec(vert.co)} ) ')
-                fw(self.texdata(face, bm, mobj))
-                pyr = bmesh.ops.poke(bm, faces=[face],
-                            offset=-self.option_depth)
-                apex = pyr['verts'][0].co
-                pyr['verts'][0].co = self.gridsnap(apex)
-                for pyrface in pyr['faces']:
-                    for vert in pyrface.verts[0:3]: # backfacing
-                        fw(f'( {self.printvec(vert.co)} ) ')
-                    pyrface.material_index = len(mobj.data.materials) - 1
-                    fw(self.texdata(pyrface, bm, mobj))
-                fw('}\n')
+                dm = ob.to_mesh()
+                dm.transform(ob.matrix_world * self.option_scale)
+                if self.option_triangulate:
+                    dm.calc_loop_triangles()
+                brushdef = self.mesh_to_brush(dm, ob)
+                for line in brushdef:
+                    fw(l)
+                    
+                ob.to_mesh_clear()
+                
+            #     orig_sel = context.selected_objects
+        #     orig_act = context.active_object
+        #     if orig_act is not None:
+        #         orig_mode = orig_act.mode
+        #         bpy.ops.object.mode_set(mode='OBJECT')
+        #     bpy.ops.object.select_all(action='DESELECT')
+        #     for obj in objects:
+        #         obj.select_set(True)
+        #     context.view_layer.objects.active = objects[0]
+        #     bpy.ops.object.duplicate()
+        #     bpy.ops.object.join()
+        #     mobj = context.active_object
+        #     mobj.data.materials.append(None) # empty slot for new faces
+        #     bm.from_mesh(mobj.data)
 
-            bpy.data.objects.remove(mobj)
-            for obj in orig_sel:
-                obj.select_set(True)
-            context.view_layer.objects.active = orig_act
-            if orig_act is not None:
-                bpy.ops.object.mode_set(mode=orig_mode)
+        #     if self.option_tm:
+        #         bmesh.ops.transform(bm, matrix=obj.matrix_world,
+        #                                         verts=bm.verts)
+        #     for vert in bm.verts:
+        #         vert.co = self.gridsnap(vert.co)
+        #     bmesh.ops.connect_verts_concave(bm, faces=bm.faces)
+        #     bmesh.ops.connect_verts_nonplanar(bm, faces=bm.faces,
+        #                                         angle_limit=0.0)
+            # for face in bm.faces[:]:
+            #     fw('{\n')
+            #     for vert in reversed(face.verts[0:3]):
+            #         fw(f'( {self.printvec(vert.co)} ) ')
+            #     fw(self.texdata(face, bm, mobj))
+            #     pyr = bmesh.ops.poke(bm, faces=[face],
+            #                 offset=-self.option_depth)
+            #     apex = pyr['verts'][0].co
+            #     pyr['verts'][0].co = self.gridsnap(apex)
+            #     for pyrface in pyr['faces']:
+            #         for vert in pyrface.verts[0:3]: # backfacing
+            #             fw(f'( {self.printvec(vert.co)} ) ')
+            #         pyrface.material_index = len(mobj.data.materials) - 1
+            #         fw(self.texdata(pyrface, bm, mobj))
+            #     fw('}\n')
+
+            # bpy.data.objects.remove(mobj)
+            # for obj in orig_sel:
+            #     obj.select_set(True)
+            # context.view_layer.objects.active = orig_act
+            # if orig_act is not None:
+            #     bpy.ops.object.mode_set(mode=orig_mode)
 
         elif self.option_geo == 'Brushes':
             for obj in objects:
                 bm.from_mesh(obj.data)
-                if self.option_tm:
-                    bmesh.ops.transform(bm, matrix=obj.matrix_world,
-                                                    verts=bm.verts)
+                #if self.option_tm:
+                #bmesh.ops.transform(bm, matrix=obj.matrix_world,
+                #                                    verts=bm.verts)
+                bm.transform(ob.matrix_world * self.option_scale)
+ 
                 for vert in bm.verts:
                     vert.co = self.gridsnap(vert.co)
                 hull = bmesh.ops.convex_hull(bm, input=bm.verts,
@@ -331,7 +379,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                 bm.clear()
 
         bm.free()
-        fw('}')
+        #fw('}')
 
         if self.option_dest == 'File':
             with open(self.filepath, 'w') as file:
