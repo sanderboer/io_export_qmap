@@ -26,6 +26,7 @@ bl_info = {
 }
 
 import bpy, bmesh, math
+import os
 from mathutils import Vector, Matrix
 from numpy.linalg import solve
 from bpy_extras.io_utils import ExportHelper
@@ -57,53 +58,78 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
     option_dest: EnumProperty(name="Save to", default='File',
         items=( ('File', "File", "Write data to a .map file"),
                 ('Clip', "Clipboard", "Store data in system buffer") ) )
-    option_skip: StringProperty(name="Fallback", default='skip',
+    option_skip: StringProperty(name="Fallback", default='__TB_empty',
         description="Texture to use on new and unassigned faces")
 
+    # https://blender.stackexchange.com/questions/75332/how-to-find-the-number-of-loose-parts-with-blenders-python-api
+    def walk_island(self,vert):
+        ''' walk all un-tagged linked verts '''    
+        vert.tag = True
+        yield(vert)
+        linked_verts = [e.other_vert(vert) for e in vert.link_edges
+                        if not e.other_vert(vert).tag]
+
+        for v in linked_verts:
+            if v.tag:
+                continue
+            yield from self.walk_island(v)
+
+    def get_islands(self,bm, verts=[]):
+        def tag(verts, switch):
+            for v in verts:
+                v.tag = switch
+        tag(bm.verts, True)
+        tag(verts, False)
+        ret = {"islands" : []}
+        verts = set(verts)
+        while verts:
+            v = verts.pop()
+            verts.add(v)
+            island = set(self.walk_island(v))
+            ret["islands"].append(list(island))
+            tag(island, False) # remove tag = True
+            verts -= island
+        return ret
+    
     def gridsnap(self, vector):
         grid = self.option_grid
         if grid:
             return [round(co/grid)*grid for co in vector]
         else:
             return vector
-
-    def mesh_to_brush(self,mesh, obj):
-        geo = []
-        fw = geo.append
-  
-        for face in mesh.faces[:]:
-            fw('{\n')
-            for vert in reversed(face.verts[0:3]):
-                fw(f'( {self.printvec(vert.co)} ) ')
-                fw(self.texdata(face, mesh, obj))
-                pyr = bmesh.ops.poke(mesh, faces=[face],
-                                     offset=-self.option_depth)
-                apex = pyr['verts'][0].co
-                pyr['verts'][0].co = self.gridsnap(apex)
-                for pyrface in pyr['faces']:
-                    for vert in pyrface.verts[0:3]: # backfacing
-                        fw(f'( {self.printvec(vert.co)} ) ')
-                    pyrface.material_index = len(mobj.data.materials) - 1
-                    fw(self.texdata(pyrface, mesh, obj))
-                fw('}\n')
-        return fw
                 
     def printvec (self, vector):
         return ' '.join([f'{co:.5g}' for co in vector])
 
+
+    def get_texture_name(self, ob, face):
+        tex_name = self.option_skip
+        if ob.material_slots != []:
+            mat = ob.material_slots[face.material_index].material
+        for n in mat.node_tree.nodes:
+            if n.type == "TEX_IMAGE":
+                filepath=n.image.filepath
+                tex_name= os.path.splitext(os.path.basename(filepath))[0]
+                img_size_x = n.image.size[0] if n.image.size[0] > 0 else img_size_x
+                img_size_y = n.image.size[1] if n.image.size[1] > 0 else img_size_y
+                break
+        return tex_name
+
     def texdata(self, face, mesh, obj):
         mat = None
         width = height = 64
-        if obj.material_slots:
-            mat = obj.material_slots[face.material_index].material
-        if mat:
-            for node in mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE':
-                    width, height = node.image.size
-                    break
-            texstring = mat.name
-        else:
-            texstring = self.option_skip
+        # if obj.material_slots:
+        #     mat = obj.material_slots[face.material_index].material
+        # if mat:
+        #     for node in mat.node_tree.nodes:
+        #         if node.type == 'TEX_IMAGE':
+        #             width, height = node.image.size
+        #             break
+        #     texstring = mat.name
+        # else:
+        #     texstring = self.option_skip
+            
+        texstring = get_texture_name(self,obj,face)
 
         V = [loop.vert.co for loop in face.loops]
         uv_layer = mesh.loops.layers.uv.active
@@ -112,7 +138,6 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
         T = [loop[uv_layer].uv for loop in face.loops]
 
         # UV handling ported from: https://bitbucket.org/khreathor/obj-2-map
-
         if self.option_format == 'Valve':
             # [ Ux Uy Uz Uoffs ] [ Vx Vy Vz Voffs ] rotation scaleU scaleV
             dummy = ' [ 1 0 0 0 ] [ 0 -1 0 0 ] 0 1 1\n'
@@ -202,7 +227,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
             rt_full[3] = (T[0].x - test_s) * width
             up_full[3] = (T[0].y - test_t) * height
 
-            texstring += f" [ {self.printvec(rt_full)} ]"\
+            texstring += f" [ {self.printvec(rt_full)} ] "\
                         f"[ {self.printvec(up_full)} ]"\
                         f" 0 {self.printvec(scale)}\n"
 
@@ -276,81 +301,85 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
 
         geo = []
         fw = geo.append
+        fw('// Game: Quake\n')
+        if self.option_format == 'Valve':
+            fw('// Format: Valve\n')
+        else:
+            fw('// Format: Quake\n')
         fw('{\n"classname" "worldspawn"\n')
         if self.option_format == 'Valve':
             fw('"mapversion" "220"\n')
-            fw('}\n')
-            
-            # bm = bmesh.new()
-
+        fw('}\n')
+        group_id=1    
         if self.option_geo == 'Faces' and objects != []:
-            depsgraph = context.evaluated_depsgraph_get() 
             for obj in objects:
-                ob = obj.evaluated_get(depsgraph)
-                fw("{\n")
-                fw('"classname" "func_group"\n')
-                fw('"_phong" "1"\n')
-                fw('"_tb_type" "_tb_group"\n')
-                fw('"_tb_name" "' + ob.name + '"\n')
-                fw('"_tb_id" "' + ob.name + '"\n')
-
-                dm = ob.to_mesh()
-                dm.transform(ob.matrix_world * self.option_scale)
+                ob = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+                bm = bmesh.new()
+                bm.from_mesh(ob.data)
+                bmesh.ops.connect_verts_concave(bm, faces=bm.faces)
                 if self.option_triangulate:
-                    dm.calc_loop_triangles()
-                brushdef = self.mesh_to_brush(dm, ob)
-                for line in brushdef:
-                    fw(l)
-                    
+                    bmesh.ops.triangulate(bm, faces=bm.faces)
+                else:
+                    bmesh.ops.connect_verts_concave(bm, faces=bm.faces)      
+                bmesh.ops.transform(bm, matrix=obj.matrix_world*self.option_scale, verts=bm.verts)
+                for vert in bm.verts:
+                    vert.co = self.gridsnap(vert.co)
+                bm.faces.ensure_lookup_table()
+
+                islands = [island for island in self.get_islands(bm, verts=bm.verts)["islands"]]
+                print(ob.name, "Islands:", len(islands))
+
+                facegroups=[]
+                for i in islands:
+                    faces=[]
+                    for f in bm.faces:
+                        is_in=True
+                        for v in f.verts:
+                            if v not in i:
+                                is_in=False
+                        if is_in:    
+                            faces.append(f)    
+                    if len(faces)>0:
+                        facegroups.append(faces)
+
+                if len(facegroups) < 1:
+                    facegroups=[bm.faces]
+                for num,facegroup in enumerate(facegroups):
+                    fw("{\n")
+                    fw('"classname" "func_group"\n')
+                    fw('"_phong" "1"\n')
+                    fw('"_tb_type" "_tb_group"\n')
+                    fw('"_tb_name" "' + ob.name + '_'+ str(num) +'"\n')
+                    fw('"_tb_id" "' + str(group_id) +'"\n')
+                    for face in facegroup[:]:
+                        fw('//brush from face from object: ' + obj.name + ' sub: '+ str(num)+'\n')
+                        fw('{\n')
+                        for vert in reversed(face.verts[0:3]):
+                            fw(f'( {self.printvec(vert.co)} ) ')
+                        fw(self.texdata(face, bm, obj))
+                        pyr = bmesh.ops.poke(bm, faces=[face],
+                                     offset=-self.option_depth)
+                        apex = pyr['verts'][0].co
+                        pyr['verts'][0].co = self.gridsnap(apex)
+                        for pyrface in pyr['faces']:
+                            for vert in pyrface.verts[0:]: # backfacing
+                                fw(f'( {self.printvec(vert.co)} ) ')
+                            pyrface.material_index = len(obj.data.materials) - 1
+                            fw(self.texdata(pyrface, bm, obj))
+                        fw('}\n') # end face
+                        group_id+=1
+                    fw('}\n') # end group
+                    group_id+=1
                 ob.to_mesh_clear()
-                
-            #     orig_sel = context.selected_objects
-        #     orig_act = context.active_object
-        #     if orig_act is not None:
-        #         orig_mode = orig_act.mode
-        #         bpy.ops.object.mode_set(mode='OBJECT')
-        #     bpy.ops.object.select_all(action='DESELECT')
-        #     for obj in objects:
-        #         obj.select_set(True)
-        #     context.view_layer.objects.active = objects[0]
-        #     bpy.ops.object.duplicate()
-        #     bpy.ops.object.join()
-        #     mobj = context.active_object
-        #     mobj.data.materials.append(None) # empty slot for new faces
-        #     bm.from_mesh(mobj.data)
-
-        #     if self.option_tm:
-        #         bmesh.ops.transform(bm, matrix=obj.matrix_world,
-        #                                         verts=bm.verts)
-        #     for vert in bm.verts:
-        #         vert.co = self.gridsnap(vert.co)
-        #     bmesh.ops.connect_verts_concave(bm, faces=bm.faces)
-        #     bmesh.ops.connect_verts_nonplanar(bm, faces=bm.faces,
-        #                                         angle_limit=0.0)
-            # for face in bm.faces[:]:
-            #     fw('{\n')
-            #     for vert in reversed(face.verts[0:3]):
-            #         fw(f'( {self.printvec(vert.co)} ) ')
-            #     fw(self.texdata(face, bm, mobj))
-            #     pyr = bmesh.ops.poke(bm, faces=[face],
-            #                 offset=-self.option_depth)
-            #     apex = pyr['verts'][0].co
-            #     pyr['verts'][0].co = self.gridsnap(apex)
-            #     for pyrface in pyr['faces']:
-            #         for vert in pyrface.verts[0:3]: # backfacing
-            #             fw(f'( {self.printvec(vert.co)} ) ')
-            #         pyrface.material_index = len(mobj.data.materials) - 1
-            #         fw(self.texdata(pyrface, bm, mobj))
-            #     fw('}\n')
-
-            # bpy.data.objects.remove(mobj)
-            # for obj in orig_sel:
-            #     obj.select_set(True)
-            # context.view_layer.objects.active = orig_act
-            # if orig_act is not None:
-            #     bpy.ops.object.mode_set(mode=orig_mode)
 
         elif self.option_geo == 'Brushes':
+            fw("{\n")
+            fw('"classname" "func_group"\n')
+            fw('"_phong" "1"\n')
+            fw('"_tb_type" "_tb_group"\n')
+            fw('"_tb_name" "' + ob.name + '_'+ str(num) +'"\n')
+            fw('"_tb_id" "' + str(group_id) +'"\n')
+
             for obj in objects:
                 bm.from_mesh(obj.data)
                 #if self.option_tm:
@@ -377,7 +406,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                     fw(self.texdata(face, bm, obj))
                 fw('}\n')
                 bm.clear()
-
+            fw('}\n')
         bm.free()
         #fw('}')
 
