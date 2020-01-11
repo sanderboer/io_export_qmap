@@ -26,7 +26,10 @@ bl_info = {
 }
 
 import bpy, bmesh, math
-import os
+import uuid
+import os, os.path
+import datetime
+from shutil import copyfile
 from mathutils import Vector, Matrix
 from numpy.linalg import solve
 from bpy_extras.io_utils import ExportHelper
@@ -43,6 +46,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
     option_sel: BoolProperty(name="Selection only", default=True)
     #option_tm: BoolProperty(name="Apply transform", default=True)
     option_triangulate: BoolProperty(name="Triangulate faces", default=True)
+    option_backface_cull: BoolProperty(name="Apply skip to backfaces", default=True)
     option_geo: EnumProperty(name="Geo", default='Faces',
         items=( ('Brushes', "Brushes", "Export each object as a convex brush"),
                 ('Faces', "Faces", "Export each face as a pyramid brush") ) )
@@ -57,6 +61,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                 ('Valve', "Valve220", "Face-bound texture projection") ) )
     option_dest: EnumProperty(name="Save to", default='File',
         items=( ('File', "File", "Write data to a .map file"),
+                ('Append', "Append", "Append data to an existing .map file"),
                 ('Clip', "Clipboard", "Store data in system buffer") ) )
     option_skip: StringProperty(name="Fallback", default='__TB_empty',
         description="Texture to use on new and unassigned faces")
@@ -102,8 +107,10 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
         return ' '.join([f'{co:.5g}' for co in vector])
 
 
-    def get_texture_name(self, ob, face):
+    def get_texture_name(self, ob, face, skip=False):
         tex_name = self.option_skip
+        if skip:
+            return tex_name
         if ob.material_slots != []:
             mat = ob.material_slots[face.material_index].material
         for n in mat.node_tree.nodes:
@@ -115,21 +122,11 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                 break
         return tex_name
 
-    def texdata(self, face, mesh, obj):
+    def texdata(self, face, mesh, obj, skip=False):
         mat = None
         width = height = 64
-        # if obj.material_slots:
-        #     mat = obj.material_slots[face.material_index].material
-        # if mat:
-        #     for node in mat.node_tree.nodes:
-        #         if node.type == 'TEX_IMAGE':
-        #             width, height = node.image.size
-        #             break
-        #     texstring = mat.name
-        # else:
-        #     texstring = self.option_skip
-            
-        texstring = get_texture_name(self,obj,face)
+
+        texstring = self.get_texture_name(obj,face,skip)
 
         V = [loop.vert.co for loop in face.loops]
         uv_layer = mesh.loops.layers.uv.active
@@ -291,7 +288,17 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
             texstring += f" {self.printvec(finvals)}\n"
 
         return texstring
-  
+
+    def prevent_overwrite(self, filepath):
+        t = datetime.datetime.now()
+        path = os.path.dirname(os.path.abspath(filepath))
+        basename = os.path.basename(filepath)
+        filename = ''.join(basename.split(".")[0:-1])
+        ext = basename.split(".")[-1]
+        backup_filepath = path + "/" + filename + t.strftime("_bak_%y%m%d_%H%M") + "." +ext
+        if os.path.exists(filepath):
+            copyfile(filepath, backup_filepath)
+    
     def execute(self, context):
         if self.option_sel:
             objects = context.selected_objects
@@ -301,16 +308,17 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
 
         geo = []
         fw = geo.append
-        fw('// Game: Quake\n')
-        if self.option_format == 'Valve':
-            fw('// Format: Valve\n')
-        else:
-            fw('// Format: Quake\n')
-        fw('{\n"classname" "worldspawn"\n')
-        if self.option_format == 'Valve':
-            fw('"mapversion" "220"\n')
-        fw('}\n')
-        group_id=1    
+        if not self.option_dest == 'Append':
+            fw('// Game: Quake\n')
+            if self.option_format == 'Valve':
+                fw('// Format: Valve\n')
+                fw('"mapversion" "220"\n')
+            else:
+                fw('// Format: Quake\n')
+            fw('{\n"classname" "worldspawn"\n')
+            fw('}\n')
+
+        group_id=uuid.uuid4().int
         if self.option_geo == 'Faces' and objects != []:
             for obj in objects:
                 ob = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
@@ -352,6 +360,8 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                     fw('"_tb_name" "' + ob.name + '_'+ str(num) +'"\n')
                     fw('"_tb_id" "' + str(group_id) +'"\n')
                     for face in facegroup[:]:
+                        if face.calc_area() < 0.001:
+                            continue
                         fw('//brush from face from object: ' + obj.name + ' sub: '+ str(num)+'\n')
                         fw('{\n')
                         for vert in reversed(face.verts[0:3]):
@@ -365,7 +375,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                             for vert in pyrface.verts[0:]: # backfacing
                                 fw(f'( {self.printvec(vert.co)} ) ')
                             pyrface.material_index = len(obj.data.materials) - 1
-                            fw(self.texdata(pyrface, bm, obj))
+                            fw(self.texdata(pyrface, bm, obj, skip=True))
                         fw('}\n') # end face
                         group_id+=1
                     fw('}\n') # end group
@@ -411,13 +421,18 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
         #fw('}')
 
         if self.option_dest == 'File':
+            self.prevent_overwrite(self.filepath)
             with open(self.filepath, 'w') as file:
+                    file.write(''.join(geo))
+        elif self.option_dest == 'Append':
+            self.prevent_overwrite(self.filepath)
+            with open(self.filepath, 'a') as file:
                 file.write(''.join(geo))
         else:
             bpy.context.window_manager.clipboard = ''.join(geo)
 
         return {'FINISHED'}
-
+    
 def menu_func_export(self, context):
     self.layout.operator(ExportQuakeMap.bl_idname, text="Quake Map (.map)")
 
