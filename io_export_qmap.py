@@ -360,7 +360,7 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                     fw('"_tb_name" "' + ob.name + '_'+ str(num) +'"\n')
                     fw('"_tb_id" "' + str(group_id) +'"\n')
                     for face in facegroup[:]:
-                        if face.calc_area() < 0.001:
+                        if face.calc_area() < 0.0000001:
                             continue
                         fw('//brush from face from object: ' + obj.name + ' sub: '+ str(num)+'\n')
                         fw('{\n')
