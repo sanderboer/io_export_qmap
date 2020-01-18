@@ -381,22 +381,25 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                     fw('}\n') # end group
                     group_id+=1
                 ob.to_mesh_clear()
-
+                bm.free()
         elif self.option_geo == 'Brushes':
             fw("{\n")
             fw('"classname" "func_group"\n')
             fw('"_phong" "1"\n')
             fw('"_tb_type" "_tb_group"\n')
-            fw('"_tb_name" "' + ob.name + '_'+ str(num) +'"\n')
+            fw('"_tb_name" "' + os.path.basename(bpy.data.filepath.split(".")[0]) +'"\n')
             fw('"_tb_id" "' + str(group_id) +'"\n')
 
             for obj in objects:
-                bm.from_mesh(obj.data)
+                ob = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+                bm = bmesh.new()
+                bm.from_mesh(ob.data)
                 #if self.option_tm:
                 #bmesh.ops.transform(bm, matrix=obj.matrix_world,
                 #                                    verts=bm.verts)
-                bm.transform(ob.matrix_world * self.option_scale)
- 
+                bm.transform(obj.matrix_world * self.option_scale)
+                if len(bm.verts)<3:
+                    continue
                 for vert in bm.verts:
                     vert.co = self.gridsnap(vert.co)
                 hull = bmesh.ops.convex_hull(bm, input=bm.verts,
@@ -415,10 +418,8 @@ class ExportQuakeMap(bpy.types.Operator, ExportHelper):
                         fw(f'( {self.printvec(vert.co)} ) ')
                     fw(self.texdata(face, bm, obj))
                 fw('}\n')
-                bm.clear()
+                bm.free()
             fw('}\n')
-        bm.free()
-        #fw('}')
 
         if self.option_dest == 'File':
             self.prevent_overwrite(self.filepath)
